@@ -1,6 +1,9 @@
+# fmt: off
+from typing import Tuple
 import torch
-from torch import FloatTensor
+from torch import FloatTensor, Tensor
 from torch.nn import Module, ModuleList, GroupNorm, Conv2d, Embedding
+from torch.nn.functional import pad
 torch.set_grad_enabled(False)
 
 
@@ -66,7 +69,7 @@ class MiddleLayer(Module):
         self.block_1 = ResnetBlock(9, 9)
         self.attn_1 = AttentionBlock()
         self.block_2 = ResnetBlock(9, 9)
-    
+
     def forward(self, h: FloatTensor) -> FloatTensor:
         h = self.block_1.forward(h)
         h = self.attn_1.forward(h)
@@ -89,10 +92,10 @@ class Upsample(Module):
 
 class UpsampleBlock(Module):
     def __init__(
-        self, 
-        log2_count_in: int, 
-        log2_count_out: int, 
-        has_attention: bool, 
+        self,
+        log2_count_in: int,
+        log2_count_out: int,
+        has_attention: bool,
         has_upsample: bool
     ):
         super().__init__()
@@ -114,7 +117,6 @@ class UpsampleBlock(Module):
 
         if has_upsample:
             self.upsample = Upsample(log2_count_out)
-
 
     def forward(self, h: FloatTensor) -> FloatTensor:
         for j in range(3):
@@ -156,17 +158,129 @@ class Decoder(Module):
         z = self.conv_out.forward(z)
         return z
 
+# fmt: on
+
+
+class Downsample(Module):
+    def __init__(self, log2_count):
+        super().__init__()
+        n = 2 ** log2_count
+        self.conv = Conv2d(n, n, 3, padding="valid", stride=2)
+
+    def forward(self, x: FloatTensor) -> FloatTensor:
+        x = pad(x, (0, 1, 0, 1))  # pad height and width dim
+        x = self.conv.forward(x)
+        return x
+
+
+class DownsampleBlock(Module):
+    def __init__(
+        self,
+        log2_count_in: int,
+        log2_count_out: int,
+        has_attention: bool,
+        has_downsample: bool,
+    ):
+        super().__init__()
+        self.has_attention = has_attention
+        self.has_downsample = has_downsample
+        self.block = ModuleList(
+            [
+                ResnetBlock(log2_count_in, log2_count_out),
+                ResnetBlock(log2_count_out, log2_count_out),
+            ]
+        )
+        if has_attention:
+            self.attn = ModuleList(
+                [
+                    AttentionBlock(),
+                    AttentionBlock(),
+                ]
+            )
+        else:
+            self.attn = ModuleList()
+
+        if has_downsample:
+            self.downsample = Downsample(log2_count_out)
+
+    def forward(self, h: FloatTensor) -> FloatTensor:
+        for i in range(len(self.block)):
+            h = self.block[i].forward(h)
+            if self.has_attention:
+                h = self.attn[i].forward(h)
+        if self.has_downsample:
+            h = self.downsample.forward(h)
+        return h
+
+
+class Encoder(Module):
+    def __init__(self):
+        super().__init__()
+
+        # downsampling
+        self.conv_in = Conv2d(3, 2 ** 7, 3, padding=1)
+        self.down = ModuleList(
+            [
+                DownsampleBlock(7, 7, False, True),
+                DownsampleBlock(7, 7, False, True),
+                DownsampleBlock(7, 8, False, True),
+                DownsampleBlock(8, 8, False, True),
+                DownsampleBlock(8, 9, True, False),
+            ]
+        )
+
+        self.mid = MiddleLayer()
+        self.norm_out = GroupNorm(2 ** 5, 2 ** 9)
+        self.conv_out = Conv2d(2 ** 9, 2 ** 8, 3, padding=1)
+
+    def forward(self, x: FloatTensor) -> FloatTensor:
+        x = self.conv_in.forward(x)
+
+        for block in self.down:
+            x = block.forward(x)
+
+        x = self.mid.forward(x)
+        x = self.norm_out.forward(x)
+        x *= torch.sigmoid(x)
+        x = self.conv_out(x)
+
+        return x
+
+
+class VectorQuantizer(Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = Embedding(2 ** 14, 2 ** 8)
+
+    def forward(self, x: FloatTensor) -> Tuple[FloatTensor, Tensor]:
+        x_flattened = x.reshape((-1, 2 ** 8))
+
+        distance = (
+            torch.sum(x_flattened ** 2, axis=1, keepdim=True)
+            + torch.sum(self.embedding.weight ** 2, axis=1)
+            - 2 * torch.matmul(x_flattened, self.embedding.weight.T)
+        )
+        min_encoding_indices = torch.argmin(distance, axis=1)
+        z_q = self.embedding(min_encoding_indices).reshape(x.shape)
+
+        min_encoding_indices = min_encoding_indices.reshape(x.shape[0], -1)
+        return z_q, min_encoding_indices
+
+
+# fmt: off
 
 class VQGanDetokenizer(Module):
     def __init__(self):
         super().__init__()
-        m, n = 2 ** 14, 2 ** 8
-        self.embedding = Embedding(m, n)
+        n = 2 ** 8
+        self.quant_conv = Conv2d(n, n, 1)
         self.post_quant_conv = Conv2d(n, n, 1)
+        self.encoder = Encoder()
         self.decoder = Decoder()
+        self.quantize = VectorQuantizer()
 
     def forward(self, z: FloatTensor) -> FloatTensor:
-        z = self.embedding.forward(z)
+        z = self.quantize.embedding.forward(z)
         z = z.view((z.shape[0], 2 ** 4, 2 ** 4, 2 ** 8))
         z = z.permute(0, 3, 1, 2).contiguous()
         z = self.post_quant_conv.forward(z)
@@ -174,3 +288,14 @@ class VQGanDetokenizer(Module):
         z = z.permute(0, 2, 3, 1)
         z = z.clip(0.0, 1.0) * 255
         return z
+
+    def encode(self, x: FloatTensor) -> FloatTensor:
+        x = x.permute([0, 3, 1, 2]) / 255
+        x = self.encoder.forward(x)
+        x = self.quant_conv.forward(x)
+        x = x.permute(0, 2, 3, 1)
+        x, min_encoding_indices = self.quantize.forward(x)
+        x = x.permute(0, 3, 1, 2)
+        return x, min_encoding_indices
+
+# fmt: on
